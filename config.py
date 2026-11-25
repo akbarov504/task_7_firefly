@@ -20,12 +20,12 @@ CAMERA_TYPE = 'usb'
 
 # OUT (Front / Tashqi kamera - MIPI CSI rkisp, /dev/video11)
 OUT_VIDEO_DEVICE = '/dev/v4l/by-path/platform-rkisp-vir1-video-index0'
-OUT_AUDIO_DEVICE = 'hw:rockchipes8311,0'     # MIKROFON YO'Q (audiosiz yoziladi)
+OUT_AUDIO_DEVICE = 'default'     # MIKROFON YO'Q (audiosiz yoziladi)
 OUT_PIXEL_FORMAT = 'nv12'    # MIPI rkisp formati
 
 # IN (Inner / Ichki kamera - Arducam USB Camera, /dev/video25)
 IN_VIDEO_DEVICE  = '/dev/v4l/by-path/platform-xhci-hcd.0.auto-usb-0:1.3:1.0-video-index0'
-IN_AUDIO_DEVICE  = 'hw:Light,0'  # Arducam USB mikrofoni
+IN_AUDIO_DEVICE  = 'default'  # Arducam USB mikrofoni
 IN_INPUT_FORMAT  = 'mjpeg'   # USB kamera formati
 
 # Eski modullar bilan moslik uchun aliaslar

@@ -43,6 +43,12 @@ RECONNECT_DELAY     = 3
 DB_SCAN_INTERVAL    = 2
 FILE_STABLE_SECONDS = 2
 
+AUDIO_STARTUP_TIMEOUT = 15
+
+OUT_AUDIO_INPUT_OPTS   = ["-use_wallclock_as_timestamps", "1", "-ar", "16000", "-ac", "2"]
+OUT_AUDIO_SOURCE_MATCH = "es8311"
+OUT_AUDIO_WPCTL_ID     = "83"
+
 DEVICE_INFO_URL      = "http://127.0.0.1:8787/info"
 TRUCK_ID_RETRY_DELAY = 3
 
@@ -87,6 +93,7 @@ def build_ffmpeg_command(
     virtual_video_device=None,
     virtual_video_device_2=None,
     virtual_audio_sink=None,
+    audio_input_opts=None,
 ):
     timestamp_pattern = os.path.join(
         OUTPUT_DIR,
@@ -111,8 +118,6 @@ def build_ffmpeg_command(
     if pixel_format:
         cmd += ["-pixel_format", pixel_format]
 
-    # USB/MJPEG kamera uchun framerate
-    # MIPI kamera o'z oqim tezligini ta'minlaydi
     if input_format == "mjpeg":
         cmd += ["-framerate", str(FPS)]
 
@@ -122,19 +127,21 @@ def build_ffmpeg_command(
         "-i", video_device,
     ]
 
-    # Audio input (ALSA)
     if audio_device:
+        dev = audio_device
+        if dev.startswith("hw:"):
+            dev = dev.replace("hw:", "plughw:", 1)
+
         cmd += [
             "-thread_queue_size", "4096",
             "-f", "alsa",
-            "-ac", str(channels),
-            "-ar", str(sample_rate),
-            "-i", audio_device,
         ]
+        if audio_input_opts:
+            cmd += list(audio_input_opts)
+        cmd += ["-i", dev]
 
     cmd += ["-max_muxing_queue_size", "4096"]
 
-    # Asosiy segment fayliga yozish
     cmd += ["-map", "0:v:0"]
 
     if audio_device:
@@ -142,12 +149,13 @@ def build_ffmpeg_command(
             "-map", "1:a:0",
             "-c:a", "aac",
             "-b:a", "64k",
+            "-ac", str(channels),
+            "-ar", str(sample_rate),
             "-af", "aresample=async=1:first_pts=0",
         ]
     else:
         cmd += ["-an"]
 
-    # Video encoding
     cmd += [
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
@@ -170,7 +178,6 @@ def build_ffmpeg_command(
         timestamp_pattern,
     ]
 
-    # 1-virtual video qurilma
     if virtual_video_device:
         cmd += [
             "-map", "0:v:0",
@@ -185,7 +192,6 @@ def build_ffmpeg_command(
             virtual_video_device,
         ]
 
-    # 2-virtual video qurilma
     if virtual_video_device_2:
         cmd += [
             "-map", "0:v:0",
@@ -200,7 +206,6 @@ def build_ffmpeg_command(
             virtual_video_device_2,
         ]
 
-    # Virtual microphone
     if audio_device and virtual_audio_sink:
         cmd += [
             "-map", "1:a:0",
@@ -220,6 +225,60 @@ def check_video_device_exists(device_path):
 
 def check_virtual_device_exists(device_path):
     return os.path.exists(device_path)
+
+def select_pipewire_source(name, match=None, wpctl_id=None):
+    """
+    ALSA 'default' / 'pipewire' qurilmasi uchun kerakli mikrofonni
+    PipeWire'da default source qilib belgilaydi (ishlayotgan stream kodidagi
+    `wpctl set-default <id>` bilan bir xil ish).
+    Avval nomi bo'yicha (pactl), topilmasa wpctl ID bo'yicha.
+    """
+    if match:
+        try:
+            out = subprocess.run(
+                ["pactl", "list", "short", "sources"],
+                capture_output=True, text=True, timeout=3, env=FFMPEG_ENV,
+            ).stdout
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if len(parts) > 1 and match.lower() in parts[1].lower() \
+                        and not parts[1].endswith(".monitor"):
+                    r = subprocess.run(
+                        ["pactl", "set-default-source", parts[1]],
+                        capture_output=True, text=True, timeout=3, env=FFMPEG_ENV,
+                    )
+                    if r.returncode == 0:
+                        print(f"[INFO] {name}: default audio source = {parts[1]}")
+                        return True
+        except Exception as e:
+            print(f"[WARN] {name}: pactl orqali source tanlashda xato: {e}")
+
+    if wpctl_id:
+        try:
+            r = subprocess.run(
+                ["wpctl", "set-default", str(wpctl_id)],
+                capture_output=True, text=True, timeout=3, env=FFMPEG_ENV,
+            )
+            if r.returncode == 0:
+                print(f"[INFO] {name}: default audio source (wpctl) = {wpctl_id}")
+                return True
+            print(f"[WARN] {name}: wpctl set-default {wpctl_id} xato: {r.stderr.strip()}")
+        except Exception as e:
+            print(f"[WARN] {name}: wpctl xatosi: {e}")
+
+    print(f"[WARN] {name}: audio source tanlanmadi (match={match}, wpctl_id={wpctl_id})")
+    return False
+
+def new_segment_started(prefix, since_ts):
+    """since_ts dan keyin shu kamera uchun yangi .mp4 fayl ochilganmi."""
+    try:
+        for f in os.listdir(OUTPUT_DIR):
+            if f.startswith(prefix + "_") and f.lower().endswith(".mp4"):
+                if os.path.getmtime(os.path.join(OUTPUT_DIR, f)) >= since_ts - 1:
+                    return True
+    except OSError:
+        pass
+    return False
 
 def pulse_sink_exists(sink_name):
     if not sink_name:
@@ -413,10 +472,19 @@ def wait_for_sync(segment_time):
 
 def camera_worker(name, video_device, audio_device, input_format, pixel_format,
                   virtual_video_device, virtual_video_device_2,
-                  virtual_audio_sink):
+                  virtual_audio_sink,
+                  audio_input_opts=None,
+                  audio_source_match=None,
+                  audio_wpctl_id=None):
     global processes
 
+    configured_audio = audio_device
+    audio_failures = 0
+    audio_disabled = False
+
     while not stop_event.is_set():
+        audio_device = None if audio_disabled else configured_audio
+
         video_ok     = check_video_device_exists(video_device)
         virtual_ok   = check_virtual_device_exists(virtual_video_device)
         virtual_ok_2 = check_virtual_device_exists(virtual_video_device_2)
@@ -442,6 +510,9 @@ def camera_worker(name, video_device, audio_device, input_format, pixel_format,
         elif audio_device and virtual_audio_sink:
             print(f"[WARN] {name}: virtual audio sink yo'q -> {virtual_audio_sink} (yozuv davom etadi)")
 
+        if audio_device in ("default", "pipewire"):
+            select_pipewire_source(name, audio_source_match, audio_wpctl_id)
+
         cmd = build_ffmpeg_command(
             video_device=video_device,
             audio_device=audio_device,
@@ -453,6 +524,7 @@ def camera_worker(name, video_device, audio_device, input_format, pixel_format,
             virtual_video_device=virtual_video_device,
             virtual_video_device_2=virtual_video_device_2,
             virtual_audio_sink=audio_sink,
+            audio_input_opts=audio_input_opts,
         )
 
         fmt_desc = input_format or pixel_format or "auto"
@@ -481,11 +553,32 @@ def camera_worker(name, video_device, audio_device, input_format, pixel_format,
         with process_lock:
             processes[name] = proc
 
+        started_at = time.time()
+        segment_seen = False
+
         while not stop_event.is_set():
             ret = proc.poll()
             if ret is not None:
                 print(f"[WARN] {name}: ffmpeg to'xtab qoldi (code={ret}). Qayta ulanish...")
+                if audio_device and not segment_seen \
+                        and time.time() - started_at < AUDIO_STARTUP_TIMEOUT:
+                    audio_failures += 1
+                    if audio_failures >= 2:
+                        print(f"[WARN] {name}: audio bilan ffmpeg ketma-ket ishga tushmadi "
+                              f"-> AUDIOSIZ rejimga o'tildi")
+                        audio_disabled = True
                 break
+
+            if audio_device and not segment_seen:
+                if new_segment_started(name, started_at):
+                    segment_seen = True
+                    audio_failures = 0
+                elif time.time() - started_at > AUDIO_STARTUP_TIMEOUT:
+                    print(f"[WARN] {name}: {AUDIO_STARTUP_TIMEOUT}s ichida segment ochilmadi "
+                          f"(audio={audio_device} qotib qoldi). AUDIOSIZ rejimga o'tildi")
+                    audio_disabled = True
+                    break
+
             time.sleep(1)
 
         terminate_process(proc, name)
@@ -556,6 +649,9 @@ def main():
             OUT_VIRTUAL_VIDEO_DEVICE,
             OUT_VIRTUAL_VIDEO_DEVICE_2,
             OUT_VIRTUAL_AUDIO_SINK,     # None
+            OUT_AUDIO_INPUT_OPTS if OUT_AUDIO_DEVICE in ("default", "pipewire") else None,
+            OUT_AUDIO_SOURCE_MATCH,
+            OUT_AUDIO_WPCTL_ID,
         ),
         daemon=True
     )
